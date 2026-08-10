@@ -1,92 +1,182 @@
-name: W11 + TailScale
+name: Windows Cloud Gaming (self-hosted)
 
 on:
   workflow_dispatch:
 
+# IMPORTANTE:
+# Use este workflow somente em uma VM Windows sua, dedicada e com GPU.
+# O runner deve ser self-hosted com as labels: self-hosted, Windows, cloud-gaming.
+# Não use um runner hospedado pelo GitHub como servidor RDP permanente.
+
+permissions:
+  contents: read
+
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
+  provision:
+    runs-on: [self-hosted, Windows, cloud-gaming]
     timeout-minutes: 350
+    env:
+      RDP_USER: HypersUsers
+      ADMIN_USER: HypersAdmins
+      TS_AUTHKEY: ${{ secrets.TS_KEY }}
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Remover aplicativos opcionais quando presentes
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          $ErrorActionPreference = 'Continue'
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Não instala Firefox, Chrome, R, Unity Hub nem o Epic Games Launcher.
+          # Se já existirem na imagem Windows, tenta removê-los silenciosamente.
+          $packages = @(
+            'Mozilla.Firefox',
+            'Google.Chrome',
+            'RProject.R',
+            'Unity.UnityHub',
+            'EpicGames.EpicGamesLauncher'
+          )
+          foreach ($package in $packages) {
+            winget uninstall --id $package --exact --silent --accept-source-agreements 2>$null
+          }
+
+          # O Edge é componente integrado em muitas imagens do Windows; não é removido
+          # à força porque isso pode quebrar componentes do sistema e o Windows Update.
+          Write-Host 'Firefox, Chrome, R, Unity Hub e Epic Games Launcher não serão instalados.'
+          Write-Host 'O Edge integrado pode permanecer na imagem do Windows.'
+          Write-Host 'Fortnite não será instalado automaticamente.'
+
+      - name: Criar usuário padrão com senha aleatória
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $length = 12
+          $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-'
+          $bytes = New-Object byte[] $length
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $password = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+            New-LocalUser -Name $env:RDP_USER `
+              -Password $securePassword `
+              -Description 'Usuário padrão para sessão remota' `
+              -PasswordNeverExpires:$false `
+              -UserMayNotChangePassword:$false
+          } else {
+            Set-LocalUser -Name $env:RDP_USER -Password $securePassword
+          }
+
+          # Garante que a conta de sessão não tenha privilégios administrativos.
+          Remove-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Enable-LocalUser -Name $env:RDP_USER
+
+          # Cria uma conta administrativa separada, com outra senha aleatória.
+          $adminBytes = New-Object byte[] $length
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($adminBytes)
+          $adminPassword = -join ($adminBytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+          $secureAdminPassword = ConvertTo-SecureString $adminPassword -AsPlainText -Force
+          $adminExisting = Get-LocalUser -Name $env:ADMIN_USER -ErrorAction SilentlyContinue
+          if ($null -eq $adminExisting) {
+            New-LocalUser -Name $env:ADMIN_USER `
+              -Password $secureAdminPassword `
+              -Description 'Conta administrativa de manutenção' `
+              -PasswordNeverExpires:$false `
+              -UserMayNotChangePassword:$false
+          } else {
+            Set-LocalUser -Name $env:ADMIN_USER -Password $secureAdminPassword
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:ADMIN_USER -ErrorAction SilentlyContinue
+          Enable-LocalUser -Name $env:ADMIN_USER
+
+          # Mascara ambas as senhas nos logs.
+          Write-Output "::add-mask::$password"
+          Write-Output "::add-mask::$adminPassword"
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ADMIN_PASSWORD=$adminPassword" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_USER=$env:RDP_USER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ADMIN_USER=$env:ADMIN_USER" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Usuário padrão criado: $env:RDP_USER"
+          Write-Host "Usuário administrativo criado: $env:ADMIN_USER"
+          Write-Host 'As duas senhas foram geradas aleatoriamente e mascaradas nos logs. Não as imprima em texto puro.'
+
+      - name: Configurar RDP com autenticação de rede
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2 -Force
+
+          netsh advfirewall firewall delete rule name='RDP-Tailscale' | Out-Null
+          if (Get-NetAdapter -Name 'Tailscale' -ErrorAction SilentlyContinue) {
+            New-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+              -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+              -Profile Any -InterfaceAlias 'Tailscale' -ErrorAction Stop
+          } else {
+            Write-Host 'A interface Tailscale ainda não existe; a regra será criada após a conexão.'
+          }
 
           Restart-Service -Name TermService -Force
+          Write-Host 'RDP habilitado com NLA e TLS; a regra permite tráfego somente pela interface Tailscale.'
 
-      - name: Create RDP User with Fixed Password
+      - name: Conectar à rede privada Tailscale
+        if: ${{ env.TS_AUTHKEY != '' }}
+        shell: pwsh
         run: |
-          $password = "P@ssw0rd!"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "Stulert" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "Stulert" -Password $securePass -AccountNeverExpires
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw 'TS_KEY não foi configurada. O workflow não habilitará acesso remoto sem uma rede privada Tailscale.'
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "Stulert"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Stulert"
-         
-          echo "RDP_CREDS=User: Stulert | Password: $password" >> $env:GITHUB_ENV
-         
-          if (-not (Get-LocalUser -Name "Stulert")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          $installerPath = Join-Path $env:TEMP 'tailscale-setup.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList '/i', "`"$installerPath`"", '/quiet', '/norestart' -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TS_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          & $tailscale up --auth-key=$env:TS_AUTHKEY --hostname="cloud-gaming-$env:GITHUB_RUN_ID"
+          $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($tsIP)) { throw 'Não foi possível obter o IP Tailscale.' }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+            -Profile Any -InterfaceAlias 'Tailscale' -ErrorAction SilentlyContinue | Out-Null
+          Write-Host "IP Tailscale: $tsIP"
 
-      - name: Maintain Connection
+      - name: Restringir alterações do Painel de Controle para o usuário de jogos
+        shell: pwsh
         run: |
-          Write-Host "RDP ACCESS"
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: Stulert"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          $ErrorActionPreference = 'Stop'
+          $sid = (Get-LocalUser -Name $env:RDP_USER).SID.Value
+          $hive = "HKU\$sid"
+          reg.exe load $hive "$env:SystemDrive\Users\$env:RDP_USER\NTUSER.DAT" | Out-Null
+          try {
+            reg.exe add "$hive\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoControlPanel /t REG_DWORD /d 1 /f | Out-Null
+            reg.exe add "$hive\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableTaskMgr /t REG_DWORD /d 1 /f | Out-Null
+          } finally {
+            reg.exe unload $hive | Out-Null
+          }
+          Write-Host 'Restrições aplicadas ao perfil do usuário padrão.'
 
+      - name: Exibir instruções sem revelar a senha nos logs
+        shell: pwsh
+        run: |
+          Write-Host 'Provisionamento concluído.'
+          if ($env:TAILSCALE_IP) { Write-Host "Endereço RDP: $env:TAILSCALE_IP`:3389" }
+          Write-Host "Usuário RDP padrão: $env:RDP_USER"
+          Write-Host "Usuário administrador: $env:ADMIN_USER"
+          Write-Host 'As senhas aleatórias estão disponíveis apenas nesta sessão como variáveis mascaradas; copie-as para um gerenciador de senhas antes de encerrar o job.'
+          Write-Host 'Depois de conectar, abra o Epic Games Launcher, faça login e instale Fortnite manualmente.'
+
+      - name: Manter a máquina disponível durante a execução
+        shell: pwsh
+        run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date -Format s)] Sessão disponível"
+            Start-Sleep -Seconds 300
           }
